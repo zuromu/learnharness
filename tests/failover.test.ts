@@ -8,7 +8,7 @@ const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0
 const message = (id: string, extra: Partial<AssistantMessage> = {}) =>
 	({ role: "assistant", content: [], api: "x", provider: "p", model: id, usage, stopReason: "stop", timestamp: 1, ...extra }) as AssistantMessage;
 
-function fake(id: string, reply: "ok" | "rate" | "other-error" | "error-after-content", calls: string[]): PiEngine {
+function fake(id: string, reply: "ok" | "rate" | "other-error" | "error-after-content" | "hang", calls: string[]): PiEngine {
 	return {
 		model: { provider: "p", id, api: "x" } as unknown as Model<Api>,
 		streamFn: () => {
@@ -16,6 +16,7 @@ function fake(id: string, reply: "ok" | "rate" | "other-error" | "error-after-co
 			const s = createAssistantMessageEventStream();
 			queueMicrotask(() => {
 				s.push({ type: "start", partial: message(id) });
+				if (reply === "hang") return;
 				if (reply === "ok") s.push({ type: "done", reason: "stop", message: message(id) });
 				else if (reply === "rate") s.push({ type: "error", reason: "error", error: message(id, { stopReason: "error", errorMessage: "Mistral API error (429): Rate limit exceeded" }) });
 				else if (reply === "other-error") s.push({ type: "error", reason: "error", error: message(id, { stopReason: "error", errorMessage: "invalid api key" }) });
@@ -77,11 +78,11 @@ describe("failover chain", () => {
 		assert.deepEqual(calls, ["a", "b"]);
 	});
 
-	it("does not fail over on other errors or after content started", async () => {
+	it("fails over on any pre-content error, but not after content started", async () => {
 		const calls: string[] = [];
 		const other = await run(withFailover([fake("a", "other-error", calls), fake("b", "ok", calls)]));
-		assert.deepEqual(calls, ["a"]);
-		assert.equal(other.final.stopReason, "error");
+		assert.deepEqual(calls, ["a", "b"]);
+		assert.equal(other.final.model, "b");
 		calls.length = 0;
 		const mid = await run(withFailover([fake("c", "error-after-content", calls), fake("d", "ok", calls)]));
 		assert.deepEqual(calls, ["c"]);
@@ -102,5 +103,14 @@ describe("failover chain", () => {
 			{ provider: "openrouter", id: "meta/llama-3:free" },
 		]);
 		assert.deepEqual(parseFreeChain(undefined), []);
+	});
+
+	it("fails over when an engine sends no content in time", async () => {
+		const calls: string[] = [];
+		const seen: string[] = [];
+		const { final } = await run(withFailover([fake("a", "hang", calls), fake("b", "ok", calls)], { firstEventTimeoutMs: 30, onFailover: (_f, _t, why) => seen.push(why) }));
+		assert.deepEqual(calls, ["a", "b"]);
+		assert.equal(final.model, "b");
+		assert.match(seen[0] ?? "", /no response within 30 ms/);
 	});
 });

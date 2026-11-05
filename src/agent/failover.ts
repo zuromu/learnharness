@@ -3,9 +3,10 @@ import type { PiEngine } from "./models.ts";
 
 /**
  * Failover chain (opt-in, used by the auto model router): try engines in
- * order and move to the next one when an attempt fails with a capacity error
- * (rate limit, request too large, overloaded) BEFORE producing any content.
- * Anything else, and any failure after content began, is forwarded unchanged.
+ * order and move to the next one when an attempt fails (rate limit, too
+ * large, model unavailable, bad key) or sends nothing in time, BEFORE it
+ * produces any content. A user abort and any failure after content began are
+ * forwarded unchanged; the last engine's result is always forwarded.
  * An engine that just failed this way is skipped for a cooldown, except the
  * last one, which is always tried.
  */
@@ -28,12 +29,15 @@ function engineKey(engine: PiEngine): string {
 
 export function withFailover(
 	engines: readonly PiEngine[],
-	options: { cooldownMs?: number; now?: () => number; onFailover?: (from: string, to: string, reason: string) => void } = {},
+	options: { cooldownMs?: number; firstEventTimeoutMs?: number; now?: () => number; onFailover?: (from: string, to: string, reason: string) => void } = {},
 ): PiEngine {
 	const primary = engines[0];
 	if (!primary) throw new Error("withFailover needs at least one engine");
 	const cooldownMs = options.cooldownMs ?? 60_000;
 	const now = options.now ?? Date.now;
+	// Free endpoints sometimes queue a request for minutes without erroring, so a
+	// non-last engine that sends no content within this time counts as failed.
+	const firstEventTimeoutMs = options.firstEventTimeoutMs ?? 25_000;
 	return {
 		model: primary.model,
 		level: primary.level,
@@ -46,19 +50,35 @@ export function withFailover(
 					const last = i === engines.length - 1;
 					const key = engineKey(engine);
 					if (!last && (cooldownUntil.get(key) ?? 0) > now()) continue;
-					const attempt: AssistantMessageEventStream = engine.streamFn(engine.model, context, streamOptions);
+					const controller = new AbortController();
+					const signal = streamOptions?.signal ? AbortSignal.any([streamOptions.signal, controller.signal]) : controller.signal;
+					const attempt: AssistantMessageEventStream = engine.streamFn(engine.model, context, { ...streamOptions, signal });
+					const iterator = attempt[Symbol.asyncIterator]();
 					const buffered: AssistantMessageEvent[] = [];
 					let forwarding = false;
 					let failedOver = false;
-					for await (const event of attempt) {
+					const failOver = (reason: string) => {
+						cooldownUntil.set(key, now() + cooldownMs);
+						options.onFailover?.(key, engineKey(engines[i + 1] ?? engine), reason);
+						controller.abort();
+						failedOver = true;
+					};
+					for (;;) {
+						let next: IteratorResult<AssistantMessageEvent>;
+						if (forwarding || last) next = await iterator.next();
+						else {
+							let timer: ReturnType<typeof setTimeout> | undefined;
+							const timeout = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), firstEventTimeoutMs); });
+							const raced = await Promise.race([iterator.next(), timeout]);
+							clearTimeout(timer);
+							if (raced === "timeout") { failOver(`no response within ${firstEventTimeoutMs} ms`); break; }
+							next = raced;
+						}
+						if (next.done) break;
+						const event = next.value;
 						if (forwarding) { out.push(event); continue; }
 						if (event.type === "start") { buffered.push(event); continue; }
-						if (event.type === "error" && !last && isCapacityError(event.error)) {
-							cooldownUntil.set(key, now() + cooldownMs);
-							options.onFailover?.(key, engineKey(engines[i + 1] ?? engine), event.error.errorMessage ?? "");
-							failedOver = true;
-							break;
-						}
+						if (event.type === "error" && !last && event.reason !== "aborted") { failOver(event.error.errorMessage ?? ""); break; }
 						forwarding = true;
 						for (const held of buffered) out.push(held);
 						out.push(event);
