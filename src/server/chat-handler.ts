@@ -40,6 +40,7 @@ import {
 	extractionEnabled,
 	graphToolsEnabled,
 	resolveConversationSpec,
+	routeConversationSlot,
 	resolveRoleSpec,
 } from "../core/settings-resolution.ts";
 import { modelsNotConfigured, providerKeyMissing as providerKeyMissingEnvelope, ROLE_SLOT, type ModelSlotName, type ProviderKeyMissing } from "../core/settings.ts";
@@ -235,7 +236,16 @@ export async function handleChatInput(
 	// write-ahead persist (nothing durable changes), and every downstream
 	// resolution (jobs/extraction gate per-need on their own tiers).
 	const effective = effectiveSettings();
-	const conversation = resolveConversationSpec(record.settings, effective.models.strong);
+	// Auto model router v1 (opt-in via LH_AUTO_ROUTE=1): the probe stage rides the
+	// cheap slot, everything else stays on strong. Off by default.
+	const conversationSlot = routeConversationSlot({
+		enabled: process.env.LH_AUTO_ROUTE === "1",
+		chat: record.settings,
+		kind: record.kind === "practice" ? "practice" : "teach",
+		probeDone: hasProbeDone(record.messages),
+		cheap: effective.models.cheap,
+	});
+	const conversation = resolveConversationSpec(record.settings, effective.models[conversationSlot]);
 	if (!conversation) {
 		const envelope = modelsNotConfigured(["strong"]);
 		console.info(`[chat ${chatId}] turn refused — ${JSON.stringify(envelope)}`);
@@ -280,13 +290,13 @@ export async function handleChatInput(
 		noDispatch: (kind) => requestCycle?.noDispatch(kind),
 	};
 	let conversationEngine: PiEngine;
-	try { conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot("strong")); }
+	try { conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot(conversationSlot)); }
 	catch { return Response.json({ error: conversation.provider === "chatgpt" ? chatGPTStreamError("model catalog") : isSubscriptionProvider(conversation.provider) ? nativeSubscriptionError(conversation.provider, "model catalog") : "The selected model is unavailable." }, { status: 503 }); }
 	const modelIdForCompaction = `${conversationEngine.model.provider}:${conversationEngine.model.id}`;
 	await ensureCompacted(
 		{
 			chatStore: stores.chatStore,
-			engine: piEngineForSpec(conversation, true, undefined, retentionForSlot("strong")),
+			engine: piEngineForSpec(conversation, true, undefined, retentionForSlot(conversationSlot)),
 			canStart: () => connectionBackgroundAllowed(conversation.provider),
 			modelId: modelIdForCompaction,
 			kind: record.kind === "practice" ? "practice" : hasProbeDone(record.messages) ? "teach" : "probe",

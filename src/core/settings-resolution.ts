@@ -121,6 +121,25 @@ export function resolveConversationSpec(
 	};
 }
 
+/** Auto model router, v1 (opt-in): which slot serves a conversation turn.
+ *  The probe stage (short multiple-choice questions) rides the CHEAP slot;
+ *  teaching and practice always ride STRONG. A chat's own model override,
+ *  a disabled router, or an empty cheap slot all fall back to STRONG, so
+ *  the default behavior is unchanged. The probe-to-teach handoff already
+ *  builds a fresh agent, so that seam is the only place a model switch
+ *  can occur. */
+export function routeConversationSlot(input: {
+	enabled: boolean;
+	chat: ChatSettings | undefined;
+	kind: "teach" | "practice" | undefined;
+	probeDone: boolean;
+	cheap: EffectiveSlot | null;
+}): "strong" | "cheap" {
+	if (!input.enabled || input.chat?.model || !input.cheap) return "strong";
+	if (input.kind === "practice" || input.probeDone) return "strong";
+	return "cheap";
+}
+
 /** Full-chain resolution for ANY role (BYOK, owner 2026-09-22):
  *  per-role override (background roles only) → SLOT → NOTHING. The
  *  conversation pair (prober/teacher) resolves the same chain MINUS the

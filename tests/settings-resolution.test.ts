@@ -18,6 +18,7 @@ import {
 	resolveRoleSpec,
 	resolveSettings,
 	resolveSlot,
+	routeConversationSlot,
 } from "../src/core/settings-resolution.ts";
 import { BACKGROUND_MODEL_ROLES, type UserSettings } from "../src/core/settings.ts";
 
@@ -266,5 +267,24 @@ describe("the graph channel gates (the wave's seam honoring)", () => {
 		assert.deepEqual(eff.agent.graphTools, {});
 		const off = resolveSettings({ version: 1, agent: { graphTools: { enabled: false } } });
 		assert.deepEqual(off.agent.graphTools, { enabled: false });
+	});
+});
+describe("routeConversationSlot (auto router v1)", () => {
+	const cheap = { provider: "zai", id: "c" };
+	const base = { enabled: true, chat: undefined, kind: "teach" as const, probeDone: false, cheap };
+
+	it("probe stage rides cheap when enabled", () => {
+		assert.equal(routeConversationSlot(base), "cheap");
+	});
+
+	it("teaching and practice stay on strong", () => {
+		assert.equal(routeConversationSlot({ ...base, probeDone: true }), "strong");
+		assert.equal(routeConversationSlot({ ...base, kind: "practice" }), "strong");
+	});
+
+	it("falls back to strong when disabled, overridden, or cheap is empty", () => {
+		assert.equal(routeConversationSlot({ ...base, enabled: false }), "strong");
+		assert.equal(routeConversationSlot({ ...base, chat: { model: { provider: "groq", id: "x" } } }), "strong");
+		assert.equal(routeConversationSlot({ ...base, cheap: null }), "strong");
 	});
 });
