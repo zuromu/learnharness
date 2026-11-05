@@ -7,6 +7,7 @@ import {
 	type TeachingAgent,
 } from "../agent/teacher-agent.ts";
 import { piEngineForSpec, type PiEngine } from "../agent/models.ts";
+import { parseFreeChain, withFailover } from "../agent/failover.ts";
 import { connectionBackgroundAllowed as subscriptionBackgroundAllowed, connectionScopeCurrent, isSubscriptionProvider } from "../agent/subscription-connections.ts";
 import { nativeSubscriptionError } from "../agent/subscription-stream.ts";
 import { chatGPTStreamError } from "../agent/chatgpt-stream.ts";
@@ -295,7 +296,20 @@ export async function handleChatInput(
 		noDispatch: (kind) => requestCycle?.noDispatch(kind),
 	};
 	let conversationEngine: PiEngine;
-	try { conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot(conversationSlot)); }
+	try {
+		conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot(conversationSlot));
+		// Auto router: the cheap probe stage may try free providers first (LH_FREE_CHAIN),
+		// falling over to the cheap slot's own model on rate-limit errors.
+		if (conversationSlot === "cheap") {
+			const free: PiEngine[] = [];
+			for (const entry of parseFreeChain(process.env.LH_FREE_CHAIN)) {
+				if (!providerKeyPresent(entry.provider)) continue;
+				try { free.push(piEngineForSpec({ ...entry, thinkingLevel: conversation.thinkingLevel }, () => callPurpose.background, lifecycle, retentionForSlot("cheap"))); }
+				catch { /* model not in the catalog: skip it */ }
+			}
+			if (free.length) conversationEngine = withFailover([...free, conversationEngine], { onFailover: (from, to, why) => console.info(`[chat ${chatId}] failover ${from} -> ${to}: ${why.slice(0, 120)}`) });
+		}
+	}
 	catch { return Response.json({ error: conversation.provider === "chatgpt" ? chatGPTStreamError("model catalog") : isSubscriptionProvider(conversation.provider) ? nativeSubscriptionError(conversation.provider, "model catalog") : "The selected model is unavailable." }, { status: 503 }); }
 	const modelIdForCompaction = `${conversationEngine.model.provider}:${conversationEngine.model.id}`;
 	await ensureCompacted(
