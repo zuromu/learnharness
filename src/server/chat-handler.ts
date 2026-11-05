@@ -243,9 +243,14 @@ export async function handleChatInput(
 		chat: record.settings,
 		kind: record.kind === "practice" ? "practice" : "teach",
 		probeDone: hasProbeDone(record.messages),
+		strong: effective.models.strong,
 		cheap: effective.models.cheap,
 	});
-	const conversation = resolveConversationSpec(record.settings, effective.models[conversationSlot]);
+	// Routed to cheap: drop the birth-stamped chat model so the cheap slot wins.
+	const conversation = resolveConversationSpec(
+		conversationSlot === "cheap" ? { ...record.settings, model: undefined } : record.settings,
+		effective.models[conversationSlot],
+	);
 	if (!conversation) {
 		const envelope = modelsNotConfigured(["strong"]);
 		console.info(`[chat ${chatId}] turn refused — ${JSON.stringify(envelope)}`);

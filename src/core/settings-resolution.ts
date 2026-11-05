@@ -133,9 +133,14 @@ export function routeConversationSlot(input: {
 	chat: ChatSettings | undefined;
 	kind: "teach" | "practice" | undefined;
 	probeDone: boolean;
+	strong: EffectiveSlot | null;
 	cheap: EffectiveSlot | null;
 }): "strong" | "cheap" {
-	if (!input.enabled || input.chat?.model || !input.cheap) return "strong";
+	// New chats are stamped at birth with the strong slot's model, so a chat
+	// model equal to the strong slot is the default, not a learner's choice.
+	const m = input.chat?.model;
+	const pinned = !!m && !(input.strong && m.provider === input.strong.provider && m.id === input.strong.id);
+	if (!input.enabled || pinned || !input.cheap) return "strong";
 	if (input.kind === "practice" || input.probeDone) return "strong";
 	return "cheap";
 }

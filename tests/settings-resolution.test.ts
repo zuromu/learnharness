@@ -271,7 +271,8 @@ describe("the graph channel gates (the wave's seam honoring)", () => {
 });
 describe("routeConversationSlot (auto router v1)", () => {
 	const cheap = { provider: "zai", id: "c" };
-	const base = { enabled: true, chat: undefined, kind: "teach" as const, probeDone: false, cheap };
+	const strong = { provider: "cc", id: "s" };
+	const base = { enabled: true, chat: undefined, kind: "teach" as const, probeDone: false, strong, cheap };
 
 	it("probe stage rides cheap when enabled", () => {
 		assert.equal(routeConversationSlot(base), "cheap");
@@ -285,6 +286,8 @@ describe("routeConversationSlot (auto router v1)", () => {
 	it("falls back to strong when disabled, overridden, or cheap is empty", () => {
 		assert.equal(routeConversationSlot({ ...base, enabled: false }), "strong");
 		assert.equal(routeConversationSlot({ ...base, chat: { model: { provider: "groq", id: "x" } } }), "strong");
+		// the birth stamp (chat model equal to the strong slot) is NOT an override
+		assert.equal(routeConversationSlot({ ...base, chat: { model: strong } }), "cheap");
 		assert.equal(routeConversationSlot({ ...base, cheap: null }), "strong");
 	});
 });
