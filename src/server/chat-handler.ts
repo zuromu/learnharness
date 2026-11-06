@@ -7,7 +7,7 @@ import {
 	type TeachingAgent,
 } from "../agent/teacher-agent.ts";
 import { piEngineForSpec, type PiEngine } from "../agent/models.ts";
-import { parseFreeChain, withFailover } from "../agent/failover.ts";
+import { freeOnlySpecs, parseFreeChain, withFailover } from "../agent/failover.ts";
 import { connectionBackgroundAllowed as subscriptionBackgroundAllowed, connectionScopeCurrent, isSubscriptionProvider } from "../agent/subscription-connections.ts";
 import { nativeSubscriptionError } from "../agent/subscription-stream.ts";
 import { chatGPTStreamError } from "../agent/chatgpt-stream.ts";
@@ -40,6 +40,7 @@ import { CLAUDE_CODE_PROVIDER } from "../core/contracts/claude-code.ts";
 import {
 	extractionEnabled,
 	graphToolsEnabled,
+	isPinnedChatModel,
 	resolveConversationSpec,
 	routeConversationSlot,
 	resolveRoleSpec,
@@ -248,10 +249,22 @@ export async function handleChatInput(
 		cheap: effective.models.cheap,
 	});
 	// Routed to cheap: drop the birth-stamped chat model so the cheap slot wins.
-	const conversation = resolveConversationSpec(
-		conversationSlot === "cheap" ? { ...record.settings, model: undefined } : record.settings,
-		effective.models[conversationSlot],
-	);
+	// Free-only mode (LH_FREE_ONLY=1, needs the router on): every conversation turn
+	// uses only the free chain in LH_FREE_CHAIN, with failover and NO paid fallback.
+	// If none of those models has a key, the turn is refused instead of falling back.
+	const freeOnly = process.env.LH_AUTO_ROUTE === "1" && process.env.LH_FREE_ONLY === "1" && !isPinnedChatModel(record.settings, effective.models.strong);
+	const freeSpecs = freeOnly ? freeOnlySpecs(process.env.LH_FREE_CHAIN, providerKeyPresent) : [];
+	const freeFirst = freeSpecs[0];
+	if (freeOnly && !freeFirst) {
+		console.info(`[chat ${chatId}] turn refused: free-only mode has no free model with a key`);
+		return Response.json({ error: "Free-only mode is on, but no model in LH_FREE_CHAIN has an API key. Nothing was sent to a paid model." }, { status: 503 });
+	}
+	const conversation = freeOnly && freeFirst
+		? { provider: freeFirst.provider, id: freeFirst.id, thinkingLevel: effective.models.strong?.thinkingLevel }
+		: resolveConversationSpec(
+			conversationSlot === "cheap" ? { ...record.settings, model: undefined } : record.settings,
+			effective.models[conversationSlot],
+		);
 	if (!conversation) {
 		const envelope = modelsNotConfigured(["strong"]);
 		console.info(`[chat ${chatId}] turn refused — ${JSON.stringify(envelope)}`);
@@ -297,17 +310,27 @@ export async function handleChatInput(
 	};
 	let conversationEngine: PiEngine;
 	try {
-		conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot(conversationSlot));
-		// Auto router: the cheap probe stage may try free providers first (LH_FREE_CHAIN),
-		// falling over to the cheap slot's own model on rate-limit errors.
-		if (conversationSlot === "cheap") {
-			const free: PiEngine[] = [];
-			for (const entry of parseFreeChain(process.env.LH_FREE_CHAIN)) {
-				if (!providerKeyPresent(entry.provider)) continue;
-				try { free.push(piEngineForSpec({ ...entry, thinkingLevel: conversation.thinkingLevel }, () => callPurpose.background, lifecycle, retentionForSlot("cheap"))); }
+		if (freeOnly) {
+			const engines: PiEngine[] = [];
+			for (const entry of freeSpecs) {
+				try { engines.push(piEngineForSpec({ ...entry, thinkingLevel: conversation.thinkingLevel }, () => callPurpose.background, lifecycle, retentionForSlot("strong"))); }
 				catch { /* model not in the catalog: skip it */ }
 			}
-			if (free.length) conversationEngine = withFailover([...free, conversationEngine], { onFailover: (from, to, why) => console.info(`[chat ${chatId}] failover ${from} -> ${to}: ${why.slice(0, 120)}`) });
+			if (engines.length === 0) throw new Error("no free model in the catalog");
+			conversationEngine = withFailover(engines, { onFailover: (from, to, why) => console.info(`[chat ${chatId}] failover ${from} -> ${to}: ${why.slice(0, 120)}`) });
+		} else {
+			conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot(conversationSlot));
+			// Auto router: the cheap probe stage may try free providers first (LH_FREE_CHAIN),
+			// falling over to the cheap slot's own model on rate-limit errors.
+			if (conversationSlot === "cheap") {
+				const free: PiEngine[] = [];
+				for (const entry of parseFreeChain(process.env.LH_FREE_CHAIN)) {
+					if (!providerKeyPresent(entry.provider)) continue;
+					try { free.push(piEngineForSpec({ ...entry, thinkingLevel: conversation.thinkingLevel }, () => callPurpose.background, lifecycle, retentionForSlot("cheap"))); }
+					catch { /* model not in the catalog: skip it */ }
+				}
+				if (free.length) conversationEngine = withFailover([...free, conversationEngine], { onFailover: (from, to, why) => console.info(`[chat ${chatId}] failover ${from} -> ${to}: ${why.slice(0, 120)}`) });
+			}
 		}
 	}
 	catch { return Response.json({ error: conversation.provider === "chatgpt" ? chatGPTStreamError("model catalog") : isSubscriptionProvider(conversation.provider) ? nativeSubscriptionError(conversation.provider, "model catalog") : "The selected model is unavailable." }, { status: 503 }); }

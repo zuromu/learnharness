@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
 import { createAssistantMessageEventStream, type AssistantMessage, type Model, type Api } from "@earendil-works/pi-ai";
-import { isCapacityError, parseFreeChain, resetFailoverCooldowns, withFailover } from "../src/agent/failover.ts";
+import { freeOnlySpecs, isCapacityError, parseFreeChain, resetFailoverCooldowns, withFailover } from "../src/agent/failover.ts";
 import type { PiEngine } from "../src/agent/models.ts";
 
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -112,5 +112,19 @@ describe("failover chain", () => {
 		assert.deepEqual(calls, ["a", "b"]);
 		assert.equal(final.model, "b");
 		assert.match(seen[0] ?? "", /no response within 30 ms/);
+	});
+
+	it("free-only list keeps only providers with a key and never adds a paid model", () => {
+		const keys = new Set(["openrouter"]);
+		assert.deepEqual(freeOnlySpecs("mistral:a,openrouter:b:free,nvidia:c", (p) => keys.has(p)), [{ provider: "openrouter", id: "b:free" }]);
+		assert.deepEqual(freeOnlySpecs("mistral:a", () => false), []);
+		assert.deepEqual(freeOnlySpecs(undefined, () => true), []);
+	});
+
+	it("a single-engine chain surfaces its error instead of falling back", async () => {
+		const calls: string[] = [];
+		const { final } = await run(withFailover([fake("only", "rate", calls)]));
+		assert.deepEqual(calls, ["only"]);
+		assert.equal(final.stopReason, "error");
 	});
 });

@@ -114,3 +114,9 @@ export function parseFreeChain(value: string | undefined): { provider: string; i
 	}
 	return out;
 }
+
+/** Free-only mode: the models a conversation turn may use. Only entries whose
+ *  provider has a key are kept. No paid model is ever added here. */
+export function freeOnlySpecs(chain: string | undefined, hasKey: (provider: string) => boolean): { provider: string; id: string }[] {
+	return parseFreeChain(chain).filter((entry) => hasKey(entry.provider));
+}

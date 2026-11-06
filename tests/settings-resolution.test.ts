@@ -17,6 +17,7 @@ import {
 	resolveModelSpec,
 	resolveRoleSpec,
 	resolveSettings,
+	isPinnedChatModel,
 	resolveSlot,
 	routeConversationSlot,
 } from "../src/core/settings-resolution.ts";
@@ -289,5 +290,15 @@ describe("routeConversationSlot (auto router v1)", () => {
 		// the birth stamp (chat model equal to the strong slot) is NOT an override
 		assert.equal(routeConversationSlot({ ...base, chat: { model: strong } }), "cheap");
 		assert.equal(routeConversationSlot({ ...base, cheap: null }), "strong");
+	});
+});
+
+describe("isPinnedChatModel", () => {
+	const strong = { provider: "cc", id: "s" };
+	it("treats the birth stamp as unpinned and a different model as pinned", () => {
+		assert.equal(isPinnedChatModel(undefined, strong), false);
+		assert.equal(isPinnedChatModel({ model: strong }, strong), false);
+		assert.equal(isPinnedChatModel({ model: { provider: "groq", id: "x" } }, strong), true);
+		assert.equal(isPinnedChatModel({ model: strong }, null), true);
 	});
 });

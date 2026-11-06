@@ -121,6 +121,14 @@ export function resolveConversationSpec(
 	};
 }
 
+/** True when the chat carries a model the learner picked. New chats are
+ *  stamped at birth with the strong slot's model, so a chat model equal to the
+ *  strong slot is the default, not a choice. */
+export function isPinnedChatModel(chat: ChatSettings | undefined, strong: EffectiveSlot | null): boolean {
+	const m = chat?.model;
+	return !!m && !(strong && m.provider === strong.provider && m.id === strong.id);
+}
+
 /** Auto model router, v1 (opt-in): which slot serves a conversation turn.
  *  The probe stage (short multiple-choice questions) rides the CHEAP slot;
  *  teaching and practice always ride STRONG. A chat's own model override,
@@ -136,11 +144,7 @@ export function routeConversationSlot(input: {
 	strong: EffectiveSlot | null;
 	cheap: EffectiveSlot | null;
 }): "strong" | "cheap" {
-	// New chats are stamped at birth with the strong slot's model, so a chat
-	// model equal to the strong slot is the default, not a learner's choice.
-	const m = input.chat?.model;
-	const pinned = !!m && !(input.strong && m.provider === input.strong.provider && m.id === input.strong.id);
-	if (!input.enabled || pinned || !input.cheap) return "strong";
+	if (!input.enabled || isPinnedChatModel(input.chat, input.strong) || !input.cheap) return "strong";
 	if (input.kind === "practice" || input.probeDone) return "strong";
 	return "cheap";
 }
