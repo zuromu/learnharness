@@ -40,8 +40,8 @@ describe("the settings store", () => {
 		writeSettings({ version: 1, appearance: { theme: "dark" } });
 		const copies = fs.readdirSync(path.dirname(SETTINGS_FILE)).filter((name) => name.startsWith("settings.json.damaged-"));
 		assert.equal(copies.length, 1);
-		assert.equal(fs.readFileSync(path.join(path.dirname(SETTINGS_FILE), copies[0]), "utf-8"), damaged);
-		fs.rmSync(path.join(path.dirname(SETTINGS_FILE), copies[0]));
+		assert.equal(fs.readFileSync(path.join(path.dirname(SETTINGS_FILE), copies[0]!), "utf-8"), damaged);
+		fs.rmSync(path.join(path.dirname(SETTINGS_FILE), copies[0]!));
 	});
 
 	it("refuses to save over a settings file that cannot be read", () => {
