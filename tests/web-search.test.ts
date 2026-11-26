@@ -106,6 +106,160 @@ describe("web_search on the injected port (web.ts)", () => {
 			safeFetchOverride.current = undefined;
 		}
 	});
+
+	it("web_fetch routes the Jina reader fallback through safeFetch instead of direct fetch", async () => {
+		const { web_fetch } = createWebTools(() => null);
+		const url = "https://example.com/spa";
+		const markdown = "Rendered paragraph content for the reader fallback. ".repeat(6).trim();
+		const seen: string[] = [];
+		let directCalls = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			directCalls++;
+			throw new Error("unexpected direct fetch");
+		}) as typeof fetch;
+		safeFetchOverride.current = async (input) => {
+			seen.push(input);
+			if (input === url) {
+				return new Response("<html><body><div id=\"root\"></div></body></html>", {
+					headers: { "content-type": "text/html; charset=utf-8" },
+				});
+			}
+			if (input === `https://r.jina.ai/${url}`) {
+				return new Response(`Title: Demo\n\nMarkdown Content:\n${markdown}`, {
+					headers: { "content-type": "text/markdown" },
+				});
+			}
+			throw new Error(`unexpected safeFetch URL: ${input}`);
+		};
+		try {
+			const out = await web_fetch!.execute!("c-jina-ok", { url });
+			assert.equal(directCalls, 0, "fallback must not bypass safeFetch");
+			assert.deepEqual(seen, [url, `https://r.jina.ai/${url}`]);
+			assert.equal(String(out.details), markdown);
+		} finally {
+			safeFetchOverride.current = undefined;
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("web_fetch caps and cancels oversized or failed Jina fallback responses", async () => {
+		const { web_fetch } = createWebTools(() => null);
+		const CHUNK = 1024 * 1024;
+		const TOTAL_CHUNKS = 64;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			throw new Error("unexpected direct fetch");
+		}) as typeof fetch;
+
+		const bigState = { sent: 0, cancelled: false };
+		const bigBody = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				if (bigState.sent === TOTAL_CHUNKS) return controller.close();
+				bigState.sent++;
+				controller.enqueue(new Uint8Array(CHUNK).fill(0x61));
+			},
+			cancel() {
+				bigState.cancelled = true;
+			},
+		});
+		const errState = { cancelled: false };
+		const errBody = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array([1, 2, 3]));
+			},
+			cancel() {
+				errState.cancelled = true;
+			},
+		});
+
+		safeFetchOverride.current = async (input) => {
+			if (input.startsWith("https://example.com/")) {
+				return new Response("<html><body><div id=\"root\"></div></body></html>", {
+					headers: { "content-type": "text/html" },
+				});
+			}
+			if (input === "https://r.jina.ai/https://example.com/big-spa") {
+				return new Response(bigBody, { headers: { "content-type": "text/markdown" } });
+			}
+			if (input === "https://r.jina.ai/https://example.com/err-spa") {
+				return new Response(errBody, { status: 503, statusText: "Service Unavailable" });
+			}
+			throw new Error(`unexpected safeFetch URL: ${input}`);
+		};
+		try {
+			const bigOut = await web_fetch!.execute!("c-jina-big", { url: "https://example.com/big-spa" });
+			assert.match(String(bigOut.details), /Could not extract readable content/);
+			assert.ok(bigState.sent <= 8, `read ${bigState.sent} MB from Jina fallback`);
+			assert.ok(bigState.cancelled, "oversized Jina stream is cancelled");
+
+			const errOut = await web_fetch!.execute!("c-jina-err", { url: "https://example.com/err-spa" });
+			assert.match(String(errOut.details), /Could not extract readable content/);
+			assert.ok(errState.cancelled, "non-ok Jina stream is cancelled");
+		} finally {
+			safeFetchOverride.current = undefined;
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("web_fetch handles mixed-case content types and cancels unconsumed response bodies", async () => {
+		const { web_fetch } = createWebTools(() => null);
+		const trackedBody = () => {
+			const state = { cancelled: false };
+			const stream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new Uint8Array([1, 2, 3]));
+				},
+				cancel() {
+					state.cancelled = true;
+				},
+			});
+			return { state, stream };
+		};
+
+		const pdf = trackedBody();
+		const img = trackedBody();
+		const fail = trackedBody();
+		const paragraph = "Mixed-case HTML headers are valid per HTTP and must still run through Readability extraction. ".repeat(4);
+
+		safeFetchOverride.current = async (input) => {
+			if (input === "https://example.com/upper.pdf") {
+				return new Response(pdf.stream, { headers: { "content-type": "Application/PDF; charset=utf-8" } });
+			}
+			if (input === "https://example.com/upper.png") {
+				return new Response(img.stream, { headers: { "content-type": "IMAGE/PNG" } });
+			}
+			if (input === "https://example.com/fail") {
+				return new Response(fail.stream, { status: 500, statusText: "Internal Server Error" });
+			}
+			if (input === "https://example.com/upper.html") {
+				return new Response(
+					`<!doctype html><html><head><title>Upper HTML</title></head><body><article><h1>Upper HTML</h1><p>${paragraph}</p></article></body></html>`,
+					{ headers: { "content-type": "Text/HTML; charset=utf-8" } },
+				);
+			}
+			throw new Error(`unexpected safeFetch URL: ${input}`);
+		};
+		try {
+			const pdfOut = await web_fetch!.execute!("c-pdf-case", { url: "https://example.com/upper.pdf" });
+			assert.match(String(pdfOut.details), /web_fetch_pdf/);
+			assert.ok(pdf.state.cancelled, "PDF response body is cancelled");
+
+			const imgOut = await web_fetch!.execute!("c-img-case", { url: "https://example.com/upper.png" });
+			assert.match(String(imgOut.details), /Unsupported content type: IMAGE\/PNG/);
+			assert.ok(img.state.cancelled, "unsupported response body is cancelled");
+
+			const failOut = await web_fetch!.execute!("c-fail-cancel", { url: "https://example.com/fail" });
+			assert.match(String(failOut.details), /HTTP 500/);
+			assert.ok(fail.state.cancelled, "error response body is cancelled");
+
+			const htmlOut = await web_fetch!.execute!("c-html-case", { url: "https://example.com/upper.html" });
+			assert.match(String(htmlOut.details), /# Upper HTML/);
+			assert.doesNotMatch(String(htmlOut.details), /<article>/);
+		} finally {
+			safeFetchOverride.current = undefined;
+		}
+	});
 });
 
 describe("keyless researcher loop", () => {

@@ -51,15 +51,18 @@ function truncate(text: string): string {
 	return `${text.slice(0, MAX_CONTENT_CHARS)}\n\n[Truncated at ${MAX_CONTENT_CHARS} characters]`;
 }
 
-/** Jina Reader fallback for JS-rendered pages (no deps — plain fetch). */
+/** Jina Reader fallback for JS-rendered pages (address-checked and size-capped). */
 async function fetchViaJina(url: string): Promise<string | null> {
 	try {
-		const res = await fetch(`https://r.jina.ai/${url}`, {
+		const res = await safeFetch(`https://r.jina.ai/${url}`, {
 			headers: { Accept: "text/markdown", "X-No-Cache": "true" },
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 		});
-		if (!res.ok) return null;
-		const content = await res.text();
+		if (!res.ok) {
+			await res.body?.cancel().catch(() => undefined);
+			return null;
+		}
+		const content = new TextDecoder().decode(await readBoundedBytes(res, MAX_RESPONSE_BYTES, "Response too large"));
 		const marker = "Markdown Content:";
 		const start = content.indexOf(marker);
 		if (start < 0) return null;
@@ -89,7 +92,10 @@ async function fetchAndExtract(url: string): Promise<string> {
 		},
 		signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 	});
-	if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+	if (!resp.ok) {
+		await resp.body?.cancel().catch(() => undefined);
+		throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+	}
 
 	// Final URL after redirects + status — the researcher's only way to
 	// tell a real page from a 200-served error body (owner-reported
@@ -97,16 +103,19 @@ async function fetchAndExtract(url: string): Promise<string> {
 	const sourceLine = `Source: ${resp.url || url} (HTTP ${resp.status})`;
 
 	const contentType = resp.headers.get("content-type") ?? "";
-	if (contentType.includes("application/pdf")) {
+	const normalizedContentType = contentType.toLowerCase();
+	if (normalizedContentType.includes("application/pdf")) {
+		await resp.body?.cancel().catch(() => undefined);
 		// Pointer, not dead-end (researcher PDF wave, 2026-10-07): the
 		// researcher's web_fetch_pdf tool downloads + triages PDFs.
 		return `web_fetch: this URL is a PDF document — call web_fetch_pdf on it to download and read it.`;
 	}
-	if (/image\/|audio\/|video\/|zip|octet-stream/.test(contentType)) {
+	if (/image\/|audio\/|video\/|zip|octet-stream/.test(normalizedContentType)) {
+		await resp.body?.cancel().catch(() => undefined);
 		throw new Error(`Unsupported content type: ${contentType.split(";")[0]}`);
 	}
 	const text = new TextDecoder().decode(await readBoundedBytes(resp, MAX_RESPONSE_BYTES, "Response too large"));
-	if (!contentType.includes("html")) return `${sourceLine}\n\n${truncate(text)}`; // plain text / markdown / code
+	if (!normalizedContentType.includes("html")) return `${sourceLine}\n\n${truncate(text)}`; // plain text / markdown / code
 
 	const extracted = htmlToMarkdown(text);
 	if (extracted) {
