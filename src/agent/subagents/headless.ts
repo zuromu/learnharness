@@ -38,6 +38,9 @@ export interface RunDemoOptions {
 	/** Optional JS expression evaluated in the page after settling; its value
 	 * is returned to the builder so it can assert on internal state. */
 	probe?: string;
+	/** Maximum wall-clock duration for a browser-service run before killing
+	 * the helper and rejecting the run. */
+	timeoutMs?: number;
 }
 
 export interface RenderSvgOptions {
@@ -160,83 +163,156 @@ export function browserServiceBinary(): string | null {
 }
 
 const BROWSER_SERVICE_TIMEOUT_MS = 15_000;
-let browserServiceProc: import("node:child_process").ChildProcess | null = null;
+export const BROWSER_RUN_TIMEOUT_MS = 45_000;
+const PAGE_RESET_TIMEOUT_MS = 5_000;
+
+type StartedBrowserService = {
+	proc: import("node:child_process").ChildProcess;
+	port: number;
+};
 
 type ConnectedBrowserService = {
 	browser: import("puppeteer-core").Browser;
 	proc: import("node:child_process").ChildProcess;
 };
 
-async function connectBrowserService(): Promise<ConnectedBrowserService | null> {
-	const puppeteer = (await import("puppeteer-core")).default;
-	const { spawn } = await import("node:child_process");
-	let port: number | null = null;
-	let proc = browserServiceProc;
+let browserServiceProc: import("node:child_process").ChildProcess | null = null;
+let browserServiceStart: Promise<StartedBrowserService | null> | null = null;
 
-	if (proc && proc.exitCode === null) {
-		// Helper alive from a previous run — reuse its endpoint.
-		port = (proc as { __cdpPort?: number }).__cdpPort ?? null;
+function isHelperAlive(
+	proc: import("node:child_process").ChildProcess | null,
+): proc is import("node:child_process").ChildProcess {
+	return proc !== null && proc.exitCode === null && proc.signalCode == null;
+}
+
+function discardBrowserService(proc: import("node:child_process").ChildProcess): void {
+	if (isHelperAlive(proc)) {
+		try {
+			proc.kill();
+		} catch {
+			/* already exited */
+		}
 	}
-	if (port === null) {
+	if (browserServiceProc === proc) browserServiceProc = null;
+}
+
+async function ensureBrowserService(): Promise<StartedBrowserService | null> {
+	if (isHelperAlive(browserServiceProc)) {
+		const port = (browserServiceProc as { __cdpPort?: number }).__cdpPort ?? null;
+		if (port !== null) return { proc: browserServiceProc, port };
+	}
+	if (browserServiceStart) return browserServiceStart;
+
+	const start = (async (): Promise<StartedBrowserService | null> => {
+		const { spawn } = await import("node:child_process");
 		const binary = browserServiceBinary();
 		if (!binary) return null;
 		// Packaged: execPath runs the bundled app (flag reaches main.cjs).
-		// Dev: the bare electron binary needs the repo root as the app arg —
-		// flagless it would open Electron's default app instead of our shell.
+		// Dev: the bare electron binary needs the repo root as the app arg;
+		// without it, Electron opens its default app instead of our shell.
 		const appArgs = process.versions.electron ? ["--browser-service"] : [
-			// src/agent/subagents → repo root
+			// src/agent/subagents -> repo root
 			path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", ".."),
 			"--browser-service",
 		];
-		proc = spawn(binary, appArgs, {
+		const startingProc = spawn(binary, appArgs, {
 			// Cast: the sanitizer is pure over a loose record; NODE_ENV is
 			// always present in a real process.env.
 			env: browserServiceSpawnEnv(process.env) as NodeJS.ProcessEnv,
 			stdio: ["ignore", "pipe", "pipe", "ipc"] as const,
 		});
-		browserServiceProc = proc;
-		const startingProc = proc;
-		port = await new Promise<number | null>((resolve) => {
+		browserServiceProc = startingProc;
+		const port = await new Promise<number | null>((resolve) => {
+			let settled = false;
 			let buf = "";
+			const finish = (value: number | null) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				startingProc.stdout?.off("data", onData);
+				startingProc.off("exit", onExit);
+				startingProc.off("error", onError);
+				resolve(value);
+			};
 			const timer = setTimeout(() => {
-				startingProc.kill();
-				resolve(null);
+				discardBrowserService(startingProc);
+				finish(null);
 			}, BROWSER_SERVICE_TIMEOUT_MS);
 			const onData = (chunk: Buffer) => {
 				buf += chunk.toString("utf8");
 				const line = buf.split("\n").find((l) => parseBrowserServiceLine(l) !== null);
-				if (line !== undefined) {
-					clearTimeout(timer);
-					resolve(parseBrowserServiceLine(line));
-				}
+				if (line !== undefined) finish(parseBrowserServiceLine(line));
 			};
-			startingProc.stdout!.on("data", onData);
-			startingProc.once("exit", () => {
-				clearTimeout(timer);
-				resolve(null);
-			});
+			const onExit = () => finish(null);
+			const onError = () => finish(null);
+			startingProc.stdout?.on("data", onData);
+			startingProc.once("exit", onExit);
+			startingProc.once("error", onError);
 		});
-		if (port === null) {
-			browserServiceProc = null;
+		if (port === null || !isHelperAlive(startingProc)) {
+			discardBrowserService(startingProc);
 			return null;
 		}
-		(proc as { __cdpPort?: number }).__cdpPort = port;
-	}
+		(startingProc as { __cdpPort?: number }).__cdpPort = port;
+		startingProc.once("exit", () => {
+			if (browserServiceProc === startingProc) browserServiceProc = null;
+		});
+		return { proc: startingProc, port };
+	})();
 
-	if (!proc) return null;
+	browserServiceStart = start;
 	try {
-		const version = await fetch(`http://127.0.0.1:${port}/json/version`);
+		return await start;
+	} finally {
+		if (browserServiceStart === start) browserServiceStart = null;
+	}
+}
+
+async function connectBrowserService(): Promise<ConnectedBrowserService | null> {
+	const started = await ensureBrowserService();
+	if (!started) return null;
+	const puppeteer = (await import("puppeteer-core")).default;
+	try {
+		const version = await fetch(`http://127.0.0.1:${started.port}/json/version`);
 		const info = (await version.json()) as { webSocketDebuggerUrl?: string };
 		if (!info.webSocketDebuggerUrl) return null;
-		// connect ≠ launch: browser.close() below merely disconnects — the
+		// connect != launch: disconnect() below drops our CDP client while the
 		// helper stays resident for the next job (IPC-owned lifetime).
 		const browser = await puppeteer.connect({
 			browserWSEndpoint: info.webSocketDebuggerUrl,
 			defaultViewport: null,
 		});
-		return { browser, proc };
+		return { browser, proc: started.proc };
 	} catch {
 		return null;
+	}
+}
+
+async function disconnectBrowser(browser: import("puppeteer-core").Browser): Promise<void> {
+	await Promise.resolve(browser.disconnect?.()).catch(() => {});
+}
+
+async function runWithDeadline<T>(
+	work: Promise<T>,
+	timeoutMs: number,
+	onTimeout: () => void,
+): Promise<T> {
+	// Absorb late rejections from abandoned work if the deadline wins and the
+	// killed helper tears down in-flight CDP calls afterwards.
+	work.catch(() => {});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			work,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					onTimeout();
+					reject(new Error(`browser service: run timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
 	}
 }
 
@@ -245,28 +321,63 @@ async function connectBrowserService(): Promise<ConnectedBrowserService | null> 
  * discards its helper, never capture a Browser while a handshake is pending. */
 let helperPageChain: Promise<unknown> = Promise.resolve();
 
-async function withBrowserPage<T>(fn: (page: import("puppeteer-core").Page) => Promise<T>): Promise<T> {
+async function withBrowserPage<T>(
+	fn: (page: import("puppeteer-core").Page) => Promise<T>,
+	opts: { timeoutMs?: number } = {},
+): Promise<T> {
+	const timeoutMs =
+		opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+			? opts.timeoutMs
+			: BROWSER_RUN_TIMEOUT_MS;
 	// Helper first (owner ruling 2026-10-10: the app's own Chromium primary,
-	// system Chrome fallback) — deterministic across users, zero install.
+	// system Chrome fallback) - deterministic across users, zero install.
 	const run = async (): Promise<{ value: T } | null> => {
 		const helper = await connectBrowserService();
 		if (!helper) return null;
-		const pages = await helper.browser.pages();
-		const page = pages.find((p) => p.target().type() === "page");
-		if (!page) throw new Error("browser service: no page target");
+		let discarded = false;
+		const discardHelper = () => {
+			if (discarded) return;
+			discarded = true;
+			discardBrowserService(helper.proc);
+		};
+		let page: import("puppeteer-core").Page | undefined;
 		try {
-			return { value: await fn(page) };
+			const value = await runWithDeadline(
+				(async () => {
+					const pages = await helper.browser.pages();
+					page = pages.find((p) => p.target().type() === "page");
+					if (!page) throw new Error("browser service: no page target");
+					return await fn(page);
+				})(),
+				timeoutMs,
+				discardHelper,
+			);
+			return { value };
 		} catch (error) {
 			if (error instanceof IsolatedPageCleanupError) {
 				// A failed retirement must never leave a live untrusted document
 				// on the shared target. The next job starts a fresh owned helper.
-				helper.proc.kill();
-				if (browserServiceProc === helper.proc) browserServiceProc = null;
+				discardHelper();
 			}
 			throw error;
 		} finally {
-			// Drop all page state (JS heap, listeners) between jobs.
-			await page.goto("about:blank").catch(() => {});
+			try {
+				if (!discarded && page) {
+					// Drop all page state (JS heap, listeners) between jobs.
+					const resetTimeoutMs = Math.min(PAGE_RESET_TIMEOUT_MS, timeoutMs);
+					try {
+						await runWithDeadline(
+							page.goto("about:blank", { timeout: resetTimeoutMs }),
+							resetTimeoutMs,
+							discardHelper,
+						);
+					} catch {
+						discardHelper();
+					}
+				}
+			} finally {
+				await disconnectBrowser(helper.browser);
+			}
 		}
 	};
 	const next = helperPageChain.then(run, run);
@@ -351,7 +462,12 @@ export async function loadIsolatedPage(page: IsolatedPage, html: string): Promis
 // ─── Demo execution ──────────────────────────────────────────────────────────
 
 async function runDemo(html: string, opts: RunDemoOptions = {}): Promise<DemoRunResult> {
-	return withBrowserPage(page => runDemoOnPage(page, html, opts));
+	const settleMs = opts.settleMs ?? 2000;
+	const timeoutMs =
+		opts.timeoutMs !== undefined && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+			? opts.timeoutMs
+			: Math.max(BROWSER_RUN_TIMEOUT_MS, settleMs + 40_000);
+	return withBrowserPage((page) => runDemoOnPage(page, html, opts), { timeoutMs });
 }
 
 /** Production execution on an owned page; the packaged gate uses this same
