@@ -19,20 +19,24 @@ type ErrorBoxCall = { title: string; content: string };
 interface BootOptions {
 	httpMode?: "ready" | "refuse" | "defer";
 	messageBoxResponse?: number;
+	messageBoxError?: Error;
 	deferMessageBox?: boolean;
 	crashOnReady?: { code: number | null; signal: string | null };
 	subscriptionsReadyError?: Error;
 	spawnError?: Error;
+	spawnErrorAndExit?: { error: Error; code: number | null; signal: string | null };
 }
 
 function bootPackaged(options: BootOptions = {}) {
 	const {
 		httpMode = "ready",
 		messageBoxResponse = 0,
+		messageBoxError,
 		deferMessageBox = false,
 		crashOnReady,
 		subscriptionsReadyError,
 		spawnError,
+		spawnErrorAndExit,
 	} = options;
 
 	const windows: FakeWindow[] = [];
@@ -41,6 +45,8 @@ function bootPackaged(options: BootOptions = {}) {
 	const exits: number[] = [];
 	const logs: string[] = [];
 	const kills: string[] = [];
+	let menu: { submenu?: { label?: string; click?: () => void }[] }[] = [];
+	let resumes = 0;
 	let relaunches = 0;
 	let quits = 0;
 	let httpAttempts = 0;
@@ -112,6 +118,7 @@ function bootPackaged(options: BootOptions = {}) {
 			} else {
 				messageBoxes.push({ options: first as MessageBoxCall["options"] });
 			}
+			if (messageBoxError) throw messageBoxError;
 			const response = deferMessageBox ? await deferredMessageBox : messageBoxResponse;
 			return { response, checkboxChecked: false };
 		},
@@ -124,7 +131,10 @@ function bootPackaged(options: BootOptions = {}) {
 		app,
 		BrowserWindow: FakeWindow,
 		dialog,
-		Menu: { buildFromTemplate: (v: unknown) => v, setApplicationMenu() {} },
+		Menu: {
+			buildFromTemplate: (v: typeof menu) => v,
+			setApplicationMenu: (v: typeof menu) => { menu = v; },
+		},
 		ipcMain: Object.assign(new EventEmitter(), { handle() {} }),
 		nativeTheme: { shouldUseDarkColors: true, themeSource: "system", on() {} },
 		session: {
@@ -204,7 +214,12 @@ function bootPackaged(options: BootOptions = {}) {
 				spawn() {
 					const child = new FakeChild();
 					children.push(child);
-					if (spawnError) {
+					if (spawnErrorAndExit) {
+						queueMicrotask(() => {
+							child.emit("error", spawnErrorAndExit.error);
+							child.crash(spawnErrorAndExit.code, spawnErrorAndExit.signal);
+						});
+					} else if (spawnError) {
 						queueMicrotask(() => child.emit("error", spawnError));
 					}
 					return child;
@@ -215,7 +230,7 @@ function bootPackaged(options: BootOptions = {}) {
 				readAppearance: () => ({ mode: "dark", background: "#141414" }),
 			};
 			if (id === "./chatgpt.cjs") return {
-				createChatGPT: () => ({ close() {}, pause() {}, resume() {} }),
+				createChatGPT: () => ({ close() {}, pause() {}, resume() { resumes++; } }),
 				fileStore: () => ({}),
 			};
 			if (id === "./chatgpt-ipc.cjs") return {
@@ -228,7 +243,7 @@ function bootPackaged(options: BootOptions = {}) {
 					ready: subscriptionsReadyError ? Promise.reject(subscriptionsReadyError) : Promise.resolve(),
 					close() {},
 					pause() {},
-					resume() {},
+					resume() { resumes++; },
 				}),
 				loadSubscriptionSDK: () => ({}),
 			};
@@ -271,7 +286,9 @@ function bootPackaged(options: BootOptions = {}) {
 		kills,
 		get relaunches() { return relaunches; },
 		get quits() { return quits; },
+		get resumes() { return resumes; },
 		get httpAttempts() { return httpAttempts; },
+		clickUpdateCheckMenu: () => menu[0]?.submenu?.find((item) => item.label === "Check for Updates…")?.click?.(),
 		resolveHttp,
 		resolveMessageBox,
 		settle,
@@ -440,5 +457,64 @@ describe("desktop server exit recovery and startup error handling", () => {
 		await f.settle();
 		assert.equal(f.relaunches, 1);
 		assert.deepEqual(f.exits, [0]);
+	});
+
+	it("does not reopen a window from the Check for Updates menu while the unexpected-exit dialog is open", async () => {
+		const f = bootPackaged({ httpMode: "ready", deferMessageBox: true });
+		await f.settle();
+		f.windows.length = 0;
+
+		f.children[0]!.crash(null, "SIGKILL");
+		await f.settle();
+		assert.equal(f.messageBoxes.length, 1);
+
+		f.clickUpdateCheckMenu();
+		await f.settle();
+		assert.equal(f.windows.length, 0);
+		assert.equal(f.resumes, 0);
+
+		f.resolveMessageBox(1);
+		await f.settle();
+		assert.equal(f.quits, 1);
+	});
+
+	it("does not relaunch if the user quits while the unexpected-exit dialog is open", async () => {
+		const f = bootPackaged({ httpMode: "ready", deferMessageBox: true });
+		await f.settle();
+
+		f.children[0]!.crash(null, "SIGKILL");
+		await f.settle();
+		assert.equal(f.messageBoxes.length, 1);
+
+		f.app.emit("before-quit");
+		f.resolveMessageBox(0);
+		await f.settle();
+		assert.equal(f.relaunches, 0);
+		assert.deepEqual(f.exits, []);
+	});
+
+	it("exits with code 1 if showing the unexpected-exit dialog throws", async () => {
+		const f = bootPackaged({ httpMode: "ready", messageBoxError: new Error("dialog unavailable") });
+		await f.settle();
+
+		f.children[0]!.crash(null, "SIGKILL");
+		await f.settle();
+
+		assert.equal(f.relaunches, 0);
+		assert.deepEqual(f.exits, [1]);
+		assert.ok(f.logs.some((line) => line.includes("server exit dialog failed: dialog unavailable")));
+	});
+
+	it("preserves the spawn error when both error and exit fire before readiness", async () => {
+		const f = bootPackaged({
+			httpMode: "defer",
+			spawnErrorAndExit: { error: new Error("spawn ENOENT"), code: -2, signal: null },
+		});
+		await f.settle();
+
+		assert.equal(f.windows.length, 0);
+		assert.equal(f.errorBoxes.length, 1);
+		assert.match(f.errorBoxes[0]!.content, /spawn ENOENT/);
+		assert.deepEqual(f.exits, [1]);
 	});
 });

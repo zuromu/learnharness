@@ -250,11 +250,11 @@ function startServer(port) {
 		child.stdout.on("data", fwd);
 		child.stderr.on("data", fwd);
 		child.on("error", (err) => {
-			childOutcomes.set(child, { error: err });
+			childOutcomes.set(child, { ...childOutcomes.get(child), error: err });
 			log(`server process error: ${err?.message ?? err}`);
 		});
 		child.on("exit", (code, signal) => {
-			childOutcomes.set(child, { exit: { code, signal } });
+			childOutcomes.set(child, { ...childOutcomes.get(child), exit: { code, signal } });
 			log(`server exited (code=${code} signal=${signal})`);
 			const unexpected = !shuttingDown && serverReady && serverProcess === child;
 			if (serverProcess === child) serverProcess = null;
@@ -794,6 +794,7 @@ async function main() {
 	process.on("SIGHUP", killServer);
 
 	await app.whenReady();
+	if (shuttingDown) return;
 
 	// Read the same record/custom theme the server uses before constructing
 	// any native window, including the external development shell.
@@ -808,6 +809,7 @@ async function main() {
 	// (guards, menu, single instance).
 	const devUrl = process.env.LH_DEV_URL;
 	const url = devUrl ?? `http://127.0.0.1:${await freePort()}`;
+	if (shuttingDown) return;
 	if (!devUrl) {
 		desktopAPISecret = randomBytes(32).toString("hex");
 		const ownedOrigin = new URL(url).origin;
@@ -935,7 +937,12 @@ async function main() {
 		nativeTheme.themeSource = themeSourceFor(appearance.mode);
 		for (const win of BrowserWindow.getAllWindows()) applyChrome(win);
 	});
-	reopenWindow = () => { chatgpt?.resume(); subscriptions?.resume(); return createWindow(url); };
+	reopenWindow = () => {
+		if (shuttingDown || handlingServerExit) return null;
+		chatgpt?.resume();
+		subscriptions?.resume();
+		return createWindow(url);
+	};
 	app.on("activate", () => {
 		if (!shuttingDown && !handlingServerExit && BrowserWindow.getAllWindows().length === 0) reopenWindow();
 	});
