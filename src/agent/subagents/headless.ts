@@ -240,7 +240,7 @@ async function ensureBrowserService(): Promise<StartedBrowserService | null> {
 			}, BROWSER_SERVICE_TIMEOUT_MS);
 			const onData = (chunk: Buffer) => {
 				buf += chunk.toString("utf8");
-				const line = buf.split("\n").find((l) => parseBrowserServiceLine(l) !== null);
+				const line = buf.split(/\r?\n/).find((l) => parseBrowserServiceLine(l) !== null);
 				if (line !== undefined) finish(parseBrowserServiceLine(line));
 			};
 			const onExit = () => finish(null);
@@ -275,7 +275,10 @@ async function connectBrowserService(): Promise<ConnectedBrowserService | null> 
 	try {
 		const version = await fetch(`http://127.0.0.1:${started.port}/json/version`);
 		const info = (await version.json()) as { webSocketDebuggerUrl?: string };
-		if (!info.webSocketDebuggerUrl) return null;
+		if (!info.webSocketDebuggerUrl) {
+			discardBrowserService(started.proc);
+			return null;
+		}
 		// connect != launch: disconnect() below drops our CDP client while the
 		// helper stays resident for the next job (IPC-owned lifetime).
 		const browser = await puppeteer.connect({
@@ -284,6 +287,7 @@ async function connectBrowserService(): Promise<ConnectedBrowserService | null> 
 		});
 		return { browser, proc: started.proc };
 	} catch {
+		discardBrowserService(started.proc);
 		return null;
 	}
 }

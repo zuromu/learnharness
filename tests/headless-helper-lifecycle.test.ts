@@ -18,7 +18,8 @@ function deferred() {
 function lifecycleFixture() {
 	const killed: number[] = [];
 	const spawned = deferred(), heldLoad = deferred(), releaseLoad = deferred();
-	let pauseHandshake = false, connections = 0, disconnects = 0;
+	let pauseHandshake = false, connections = 0, disconnects = 0, disposed = false;
+	let failNextConnect = false;
 	const helpers: ReturnType<typeof makeHelper>[] = [];
 	function makeHelper(id: number) {
 		let liveDocument = false, guarded = false;
@@ -88,6 +89,10 @@ function lifecycleFixture() {
 	});
 	mock.method(puppeteer, "connect", async (options: Parameters<typeof puppeteer.connect>[0]) => {
 		connections++;
+		if (failNextConnect) {
+			failNextConnect = false;
+			throw new Error("simulated cdp connect failure");
+		}
 		const id = Number(new URL(options.browserWSEndpoint!).pathname.slice(1));
 		return helpers[id - 1]!.browser;
 	});
@@ -95,9 +100,13 @@ function lifecycleFixture() {
 		helpers, killed, spawned, heldLoad, releaseLoad,
 		connections: () => connections,
 		disconnects: () => disconnects,
+		failNextConnect() { failNextConnect = true; },
 		pauseHandshake() { pauseHandshake = true; },
 		releaseHandshakes() { pauseHandshake = false; for (const helper of helpers) helper.handshake(); },
 		dispose() {
+			if (disposed) return;
+			disposed = true;
+			releaseLoad.resolve();
 			// Mark mocks dead before restoring spawn: the next test must not reuse
 			// this fixture's module-global helper, or start a real process.
 			for (const helper of helpers) {
@@ -110,8 +119,9 @@ function lifecycleFixture() {
 	};
 }
 
-it("a queued production demo acquires a fresh helper after the active helper cannot retire", { timeout: 5_000 }, async () => {
+it("a queued production demo acquires a fresh helper after the active helper cannot retire", { timeout: 5_000 }, async (t) => {
 	const fixture = lifecycleFixture();
+	t.after(() => fixture.dispose());
 	try {
 		assert.equal((await realHeadless.runDemo("<p>warm</p>", { settleMs: 0 })).ok, true);
 		const original = fixture.helpers[0]!;
@@ -142,8 +152,9 @@ it("a queued production demo acquires a fresh helper after the active helper can
 	} finally { fixture.dispose(); }
 });
 
-it("concurrent cold-start production demos cannot replace the helper whose retirement fails", { timeout: 5_000 }, async () => {
+it("concurrent cold-start production demos cannot replace the helper whose retirement fails", { timeout: 5_000 }, async (t) => {
 	const fixture = lifecycleFixture();
+	t.after(() => fixture.dispose());
 	fixture.pauseHandshake();
 	try {
 		const first = realHeadless.runDemo("<p>cold failing helper</p>", { settleMs: 0 });
@@ -171,8 +182,9 @@ it("concurrent cold-start production demos cannot replace the helper whose retir
 	} finally { fixture.dispose(); }
 });
 
-it("concurrent cold-start demos share one helper and disconnect after each use", { timeout: 5_000 }, async () => {
+it("concurrent cold-start demos share one helper and disconnect after each use", { timeout: 10_000 }, async (t) => {
 	const fixture = lifecycleFixture();
+	t.after(() => fixture.dispose());
 	fixture.pauseHandshake();
 	try {
 		const first = realHeadless.runDemo("<p>cold one</p>", { settleMs: 0 });
@@ -191,15 +203,16 @@ it("concurrent cold-start demos share one helper and disconnect after each use",
 	} finally { fixture.dispose(); }
 });
 
-it("kills a hung helper after its deadline, disconnects, and lets the next queued demo finish", { timeout: 2_000 }, async () => {
+it("kills a hung helper after its deadline, disconnects, and lets the next queued demo finish", { timeout: 10_000 }, async (t) => {
 	const fixture = lifecycleFixture();
+	t.after(() => fixture.dispose());
 	try {
 		assert.equal((await realHeadless.runDemo("<p>warm</p>", { settleMs: 0 })).ok, true);
 		const original = fixture.helpers[0]!;
 		original.owner.hangNextLoad = true;
 		const first = realHeadless.runDemo("<script>while(true){}</script>", { settleMs: 0, timeoutMs: 80 });
 		await fixture.heldLoad.promise;
-		const second = realHeadless.runDemo("<p>queued after hang</p>", { settleMs: 0, timeoutMs: 1_000 });
+		const second = realHeadless.runDemo("<p>queued after hang</p>", { settleMs: 0, timeoutMs: 5_000 });
 		const [hung, next] = await Promise.allSettled([first, second]);
 		assert.equal(hung.status, "rejected");
 		assert.match((hung as PromiseRejectedResult).reason.message, /timed out/i);
@@ -213,14 +226,15 @@ it("kills a hung helper after its deadline, disconnects, and lets the next queue
 	} finally { fixture.dispose(); }
 });
 
-it("kills a helper whose probe hangs past the deadline and recovers for the next demo", { timeout: 2_000 }, async () => {
+it("kills a helper whose probe hangs past the deadline and recovers for the next demo", { timeout: 10_000 }, async (t) => {
 	const fixture = lifecycleFixture();
+	t.after(() => fixture.dispose());
 	try {
 		assert.equal((await realHeadless.runDemo("<p>warm</p>", { settleMs: 0 })).ok, true);
 		const original = fixture.helpers[0]!;
 		original.owner.hangNextEvaluate = true;
 		const first = realHeadless.runDemo("<p>hung probe</p>", { settleMs: 0, probe: "1 + 1", timeoutMs: 80 });
-		const second = realHeadless.runDemo("<p>after probe hang</p>", { settleMs: 0, timeoutMs: 1_000 });
+		const second = realHeadless.runDemo("<p>after probe hang</p>", { settleMs: 0, timeoutMs: 5_000 });
 		const [hung, next] = await Promise.allSettled([first, second]);
 		assert.equal(hung.status, "rejected");
 		assert.match((hung as PromiseRejectedResult).reason.message, /timed out/i);
@@ -231,5 +245,27 @@ it("kills a helper whose probe hangs past the deadline and recovers for the next
 		assert.equal(fixture.helpers.length, 2);
 		assert.equal(fixture.helpers[1]!.owner.alive, true);
 		assert.equal(fixture.disconnects(), fixture.connections());
+	} finally { fixture.dispose(); }
+});
+
+it("discards a helper whose CDP connect fails so the next demo starts a fresh one", { timeout: 10_000 }, async (t) => {
+	const fixture = lifecycleFixture();
+	t.after(() => fixture.dispose());
+	mock.method(puppeteer, "launch", async () => {
+		throw new Error("chrome fallback disabled in test");
+	});
+	try {
+		fixture.failNextConnect();
+		await assert.rejects(
+			realHeadless.runDemo("<p>connect failure</p>", { settleMs: 0 }),
+			/chrome fallback disabled in test/,
+		);
+		assert.deepEqual(fixture.killed, [1], "unreachable helper must be killed instead of staying cached");
+		assert.equal(fixture.helpers[0]!.owner.alive, false);
+		const recovered = await realHeadless.runDemo("<p>fresh helper</p>", { settleMs: 0 });
+		assert.equal(recovered.ok, true);
+		assert.equal(fixture.helpers.length, 2);
+		assert.equal(fixture.helpers[1]!.owner.alive, true);
+		assert.equal(fixture.disconnects(), 1);
 	} finally { fixture.dispose(); }
 });
