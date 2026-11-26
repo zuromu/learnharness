@@ -19,6 +19,8 @@ type ErrorBoxCall = { title: string; content: string };
 interface BootOptions {
 	httpMode?: "ready" | "refuse" | "defer";
 	messageBoxResponse?: number;
+	deferMessageBox?: boolean;
+	crashOnReady?: { code: number | null; signal: string | null };
 	subscriptionsReadyError?: Error;
 	spawnError?: Error;
 }
@@ -27,6 +29,8 @@ function bootPackaged(options: BootOptions = {}) {
 	const {
 		httpMode = "ready",
 		messageBoxResponse = 0,
+		deferMessageBox = false,
+		crashOnReady,
 		subscriptionsReadyError,
 		spawnError,
 	} = options;
@@ -42,6 +46,8 @@ function bootPackaged(options: BootOptions = {}) {
 	let httpAttempts = 0;
 	let resolveHttp!: () => void;
 	const deferredHttp = new Promise<void>((resolve) => { resolveHttp = resolve; });
+	let resolveMessageBox!: (response: number) => void;
+	const deferredMessageBox = new Promise<number>((resolve) => { resolveMessageBox = resolve; });
 
 	const children: FakeChild[] = [];
 	class FakeChild extends EventEmitter {
@@ -106,7 +112,8 @@ function bootPackaged(options: BootOptions = {}) {
 			} else {
 				messageBoxes.push({ options: first as MessageBoxCall["options"] });
 			}
-			return { response: messageBoxResponse, checkboxChecked: false };
+			const response = deferMessageBox ? await deferredMessageBox : messageBoxResponse;
+			return { response, checkboxChecked: false };
 		},
 		showErrorBox(title: string, content: string) {
 			errorBoxes.push({ title, content });
@@ -147,7 +154,10 @@ function bootPackaged(options: BootOptions = {}) {
 			});
 			if (httpMode === "ready") {
 				queueMicrotask(() => {
-					if (!req.destroyed) cb({ statusCode: 200, resume() {} });
+					if (!req.destroyed) {
+						cb({ statusCode: 200, resume() {} });
+						if (crashOnReady) children[0]?.crash(crashOnReady.code, crashOnReady.signal);
+					}
 				});
 			} else if (httpMode === "refuse") {
 				queueMicrotask(() => {
@@ -177,11 +187,6 @@ function bootPackaged(options: BootOptions = {}) {
 	const fakeClearTimeout = (handle: { id?: number } | null | undefined) => {
 		if (handle?.id !== undefined) activeTimers.delete(handle.id);
 	};
-
-	const subscriptionsReady = subscriptionsReadyError
-		? Promise.reject(subscriptionsReadyError)
-		: Promise.resolve();
-	// Attach a no-op handler only if the caller did not observe it yet? No, main() awaits it synchronously after whenReady.
 
 	const context = createContext({
 		require: (id: string) => {
@@ -219,7 +224,12 @@ function bootPackaged(options: BootOptions = {}) {
 				chatGPTControl: () => ({}),
 			};
 			if (id === "./subscriptions.cjs") return {
-				createSubscriptions: () => ({ ready: subscriptionsReady, close() {}, pause() {}, resume() {} }),
+				createSubscriptions: () => ({
+					ready: subscriptionsReadyError ? Promise.reject(subscriptionsReadyError) : Promise.resolve(),
+					close() {},
+					pause() {},
+					resume() {},
+				}),
 				loadSubscriptionSDK: () => ({}),
 			};
 			if (id === "./subscription-ipc.cjs") return {
@@ -263,6 +273,7 @@ function bootPackaged(options: BootOptions = {}) {
 		get quits() { return quits; },
 		get httpAttempts() { return httpAttempts; },
 		resolveHttp,
+		resolveMessageBox,
 		settle,
 	};
 }
@@ -399,5 +410,35 @@ describe("desktop server exit recovery and startup error handling", () => {
 		assert.deepEqual(f.errorBoxes, []);
 		assert.deepEqual(f.messageBoxes, []);
 		assert.deepEqual(f.exits, []);
+	});
+
+	it("shows a startup error dialog if the server exits right after readiness before the window opens", async () => {
+		const f = bootPackaged({ httpMode: "ready", crashOnReady: { code: null, signal: "SIGKILL" } });
+		await f.settle();
+
+		assert.equal(f.windows.length, 0);
+		assert.equal(f.errorBoxes.length, 1);
+		assert.equal(f.messageBoxes.length, 0);
+		assert.match(f.errorBoxes[0]!.content, /SIGKILL/);
+		assert.deepEqual(f.exits, [1]);
+	});
+
+	it("does not reopen a window on activate while the unexpected-exit dialog is open", async () => {
+		const f = bootPackaged({ httpMode: "ready", deferMessageBox: true });
+		await f.settle();
+		f.windows.length = 0;
+
+		f.children[0]!.crash(null, "SIGKILL");
+		await f.settle();
+		assert.equal(f.messageBoxes.length, 1);
+
+		f.app.emit("activate");
+		await f.settle();
+		assert.equal(f.windows.length, 0);
+
+		f.resolveMessageBox(0);
+		await f.settle();
+		assert.equal(f.relaunches, 1);
+		assert.deepEqual(f.exits, [0]);
 	});
 });

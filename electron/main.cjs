@@ -839,6 +839,11 @@ async function main() {
 		const child = await startServer(new URL(url).port);
 		await waitUntilUp(url, 150, child);
 		if (shuttingDown) return;
+		if (serverProcess !== child) {
+			const outcome = childOutcomes.get(child);
+			if (outcome?.error) throw outcome.error;
+			throw new Error(`server exited before ready (${formatExit(outcome?.exit?.code ?? child.exitCode, outcome?.exit?.signal ?? child.signalCode)})`);
+		}
 		serverReady = true;
 		log(`server up: ${url}`);
 	} else {
@@ -932,7 +937,7 @@ async function main() {
 	});
 	reopenWindow = () => { chatgpt?.resume(); subscriptions?.resume(); return createWindow(url); };
 	app.on("activate", () => {
-		if (BrowserWindow.getAllWindows().length === 0) reopenWindow();
+		if (!shuttingDown && !handlingServerExit && BrowserWindow.getAllWindows().length === 0) reopenWindow();
 	});
 	createWindow(url);
 	log(`window open: ${url}`);
