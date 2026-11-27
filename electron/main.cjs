@@ -59,6 +59,10 @@ const DATA_DIR = () => path.join(app.getPath("userData"), "data");
 // it current after live saves. This helper needs no compiled server bundle.
 const { normalizeAppearance, themeSourceFor, serverDataDir, readAppearance, chromeColors } = require("./appearance-chrome.cjs");
 let appearance = normalizeAppearance(null);
+let shuttingDown = false;
+let serverReady = false;
+let handlingServerExit = false;
+const childOutcomes = new WeakMap();
 
 function applyChrome(win) {
 	if (win.isDestroyed()) return;
@@ -143,7 +147,7 @@ if (process.argv.includes("--browser-service")) {
 				win.focus();
 			}
 		});
-		main();
+		main().catch(handleStartupError);
 	}
 }
 
@@ -245,31 +249,138 @@ function startServer(port) {
 		const fwd = (buf) => buf.toString().trimEnd().split("\n").forEach((l) => l && log(`server: ${l}`));
 		child.stdout.on("data", fwd);
 		child.stderr.on("data", fwd);
+		child.on("error", (err) => {
+			childOutcomes.set(child, { ...childOutcomes.get(child), error: err });
+			log(`server process error: ${err?.message ?? err}`);
+		});
 		child.on("exit", (code, signal) => {
+			childOutcomes.set(child, { ...childOutcomes.get(child), exit: { code, signal } });
 			log(`server exited (code=${code} signal=${signal})`);
-			serverProcess = null;
+			const unexpected = !shuttingDown && serverReady && serverProcess === child;
+			if (serverProcess === child) serverProcess = null;
 			chatgptChild?.dispose();
 			chatgptChild = null;
 			subscriptionChild?.dispose();
 			subscriptionChild = null;
 			chatgpt?.close();
 			subscriptions?.close();
+			if (unexpected) {
+				void handleUnexpectedServerExit(code, signal);
+			}
 		});
 		resolve(child);
 	});
 }
 
-/** No "ready" event exists — poll until the server answers (docs-confirmed). */
-function waitUntilUp(url, tries = 150) {
+function formatExit(code, signal) {
+	if (signal) return `signal ${signal}`;
+	if (code !== null && code !== undefined) return `exit code ${code}`;
+	return "unknown reason";
+}
+
+function handleStartupError(err) {
+	if (shuttingDown) return;
+	const detail = err?.message || String(err);
+	log(`startup failed: ${detail}`);
+	killServer();
+	try {
+		dialog.showErrorBox(
+			`${PRODUCT_NAME} failed to start`,
+			`Could not start the ${PRODUCT_NAME} server.\n\n${detail}`,
+		);
+	} catch (dialogErr) {
+		log(`startup error dialog failed: ${dialogErr?.message ?? dialogErr}`);
+	}
+	app.exit(1);
+}
+
+async function handleUnexpectedServerExit(code, signal) {
+	if (handlingServerExit || shuttingDown) return;
+	handlingServerExit = true;
+	const reason = formatExit(code, signal);
+	const options = {
+		type: "error",
+		buttons: ["Restart", "Quit"],
+		defaultId: 0,
+		cancelId: 1,
+		title: PRODUCT_NAME,
+		message: `${PRODUCT_NAME} stopped unexpectedly`,
+		detail: `The background server exited (${reason}). Restart ${PRODUCT_NAME} to continue.`,
+	};
+	try {
+		const parent = BrowserWindow.getAllWindows().find((win) => !win.isDestroyed?.());
+		const { response } = parent
+			? await dialog.showMessageBox(parent, options)
+			: await dialog.showMessageBox(options);
+		if (shuttingDown) return;
+		shuttingDown = true;
+		if (response === 0) {
+			log("restarting after unexpected server exit");
+			app.relaunch();
+			app.exit(0);
+		} else {
+			app.quit();
+		}
+	} catch (err) {
+		log(`server exit dialog failed: ${err?.message ?? err}`);
+		if (!shuttingDown) {
+			shuttingDown = true;
+			app.exit(1);
+		}
+	}
+}
+
+/** No "ready" event exists - poll until the server answers (docs-confirmed). */
+function waitUntilUp(url, tries = 150, child = serverProcess) {
 	return new Promise((resolve, reject) => {
+		let settled = false;
+		let retryTimer = null;
+		let activeReq = null;
+		const finish = (err, ok) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(retryTimer);
+			child?.removeListener?.("exit", onExit);
+			child?.removeListener?.("error", onError);
+			if (err) {
+				activeReq?.destroy();
+				reject(err);
+			} else {
+				resolve(ok);
+			}
+		};
+		const onExit = (code, signal) => finish(new Error(`server exited before ready (${formatExit(code, signal)})`));
+		const onError = (err) => finish(err instanceof Error ? err : new Error(String(err)));
+		if (child) {
+			const outcome = childOutcomes.get(child);
+			if (outcome?.error) {
+				onError(outcome.error);
+				return;
+			}
+			if (outcome?.exit) {
+				onExit(outcome.exit.code, outcome.exit.signal);
+				return;
+			}
+			if (child.exitCode != null || child.signalCode != null) {
+				onExit(child.exitCode, child.signalCode);
+				return;
+			}
+			child.once("exit", onExit);
+			child.once("error", onError);
+		}
 		const attempt = (n) => {
+			if (settled) return;
 			const req = http.get(url, (res) => {
+				activeReq = null;
 				res.resume();
-				resolve(res.statusCode !== undefined);
+				finish(null, res.statusCode !== undefined);
 			});
+			activeReq = req;
 			req.on("error", () => {
-				if (n <= 0) reject(new Error(`server never answered on ${url}`));
-				else setTimeout(() => attempt(n - 1), 200);
+				activeReq = null;
+				if (settled) return;
+				if (n <= 0) finish(new Error(`server never answered on ${url}`));
+				else retryTimer = setTimeout(() => attempt(n - 1), 200);
 			});
 		};
 		attempt(tries);
@@ -277,19 +388,25 @@ function waitUntilUp(url, tries = 150) {
 }
 
 function killServer() {
+	shuttingDown = true;
 	chatgpt?.close();
 	subscriptions?.close();
 	if (!serverProcess) return;
 	const child = serverProcess;
 	serverProcess = null;
-	child.kill("SIGTERM");
-	setTimeout(() => {
+	try {
+		child.kill("SIGTERM");
+	} catch {
+		/* already gone */
+	}
+	const timer = setTimeout(() => {
 		try {
 			child.kill("SIGKILL");
 		} catch {
 			/* already gone */
 		}
 	}, 3000);
+	timer?.unref?.();
 }
 
 /** Links leaving the app window may open only in a browser or mail client:
@@ -678,6 +795,7 @@ async function main() {
 	process.on("SIGHUP", killServer);
 
 	await app.whenReady();
+	if (shuttingDown) return;
 
 	// Read the same record/custom theme the server uses before constructing
 	// any native window, including the external development shell.
@@ -692,6 +810,7 @@ async function main() {
 	// (guards, menu, single instance).
 	const devUrl = process.env.LH_DEV_URL;
 	const url = devUrl ?? `http://127.0.0.1:${await freePort()}`;
+	if (shuttingDown) return;
 	if (!devUrl) {
 		desktopAPISecret = randomBytes(32).toString("hex");
 		const ownedOrigin = new URL(url).origin;
@@ -717,10 +836,18 @@ async function main() {
 			},
 		});
 		await subscriptions.ready;
+		if (shuttingDown) return;
 		log(`starting server: ${serverEntry()}`);
 		log(`data dir: ${DATA_DIR()}${fs.existsSync(AUTH_FILE()) ? " · auth.json: present" : " · auth.json: ABSENT (no BYOK keys yet)"}`);
-		await startServer(new URL(url).port);
-		await waitUntilUp(url);
+		const child = await startServer(new URL(url).port);
+		await waitUntilUp(url, 150, child);
+		if (shuttingDown) return;
+		if (serverProcess !== child) {
+			const outcome = childOutcomes.get(child);
+			if (outcome?.error) throw outcome.error;
+			throw new Error(`server exited before ready (${formatExit(outcome?.exit?.code ?? child.exitCode, outcome?.exit?.signal ?? child.signalCode)})`);
+		}
+		serverReady = true;
 		log(`server up: ${url}`);
 	} else {
 		log(`dev mode: ${devUrl} — waiting for server`);
@@ -819,9 +946,14 @@ async function main() {
 		nativeTheme.themeSource = themeSourceFor(appearance.mode);
 		for (const win of BrowserWindow.getAllWindows()) applyChrome(win);
 	});
-	reopenWindow = () => { chatgpt?.resume(); subscriptions?.resume(); return createWindow(url); };
+	reopenWindow = () => {
+		if (shuttingDown || handlingServerExit) return null;
+		chatgpt?.resume();
+		subscriptions?.resume();
+		return createWindow(url);
+	};
 	app.on("activate", () => {
-		if (BrowserWindow.getAllWindows().length === 0) reopenWindow();
+		if (!shuttingDown && !handlingServerExit && BrowserWindow.getAllWindows().length === 0) reopenWindow();
 	});
 	createWindow(url, firstWindow => {
 		const fromFirstWindow = event => !firstWindow.isDestroyed() && event.sender === firstWindow.webContents &&
